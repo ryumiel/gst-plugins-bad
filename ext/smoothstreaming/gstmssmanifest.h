@@ -72,5 +72,8 @@ const gchar * gst_mss_stream_get_lang (GstMssStream * stream);
 
 const gchar * gst_mss_stream_type_name (GstMssStreamType streamtype);
 
+gboolean gst_mss_stream_fragment_parsing_needed(GstMssStream * stream);
+void gst_mss_stream_fragment_parse(GstMssStream * stream, GstBuffer * buffer);
+
 G_END_DECLS
 #endif /* __GST_MSS_MANIFEST_H__ */

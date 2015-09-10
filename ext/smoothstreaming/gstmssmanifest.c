@@ -1,5 +1,7 @@
 /* GStreamer
  * Copyright (C) 2012 Smart TV Alliance
+ * Copyright (C) 2015 Igalia S.L
+ * Copyright (C) 2015 Metrological
  *  Author: Thiago Sousa Santos <thiago.sousa.santos@collabora.com>, Collabora Ltd.
  *
  * gstmssmanifest.c:
@@ -31,6 +33,7 @@
 #include <gst/codecparsers/gsth264parser.h>
 
 #include "gstmssmanifest.h"
+#include "gstmssfragmentparser.h"
 
 GST_DEBUG_CATEGORY_EXTERN (mssdemux_debug);
 #define GST_CAT_DEFAULT mssdemux_debug
@@ -73,11 +76,16 @@ struct _GstMssStream
   gboolean active;              /* if the stream is currently being used */
   gint selectedQualityIndex;
 
+  gboolean has_live_fragments;
+  GQueue live_fragments;
+
   GList *fragments;
   GList *qualities;
 
   gchar *url;
   gchar *lang;
+
+  GstMssFragmentParser fragment_parser;
 
   guint fragment_repetition_index;
   GList *current_fragment;
@@ -94,6 +102,7 @@ struct _GstMssManifest
   xmlNodePtr xmlrootnode;
 
   gboolean is_live;
+  guint64 look_ahead_fragment_count;
 
   GString *protection_system_id;
   gchar *protection_data;
@@ -233,7 +242,8 @@ compare_bitrate (GstMssStreamQuality * a, GstMssStreamQuality * b)
 }
 
 static void
-_gst_mss_stream_init (GstMssStream * stream, xmlNodePtr node)
+_gst_mss_stream_init (GstMssManifest * manifest, GstMssStream * stream,
+    xmlNodePtr node)
 {
   xmlNodePtr iter;
   GstMssFragmentListBuilder builder;
@@ -246,9 +256,18 @@ _gst_mss_stream_init (GstMssStream * stream, xmlNodePtr node)
   stream->url = (gchar *) xmlGetProp (node, (xmlChar *) MSS_PROP_URL);
   stream->lang = (gchar *) xmlGetProp (node, (xmlChar *) MSS_PROP_LANGUAGE);
 
+  /* for live playback each fragment usually has timing
+   * information for the few next look-ahead fragments so the
+   * playlist can be built incrementally from the first fragment
+   * of the manifest.
+   */
+  stream->has_live_fragments = manifest->is_live
+      && manifest->look_ahead_fragment_count;
+
   for (iter = node->children; iter; iter = iter->next) {
     if (node_has_type (iter, MSS_NODE_STREAM_FRAGMENT)) {
-      gst_mss_fragment_list_builder_add (&builder, iter);
+      if (!stream->has_live_fragments || !builder.fragments)
+        gst_mss_fragment_list_builder_add (&builder, iter);
     } else if (node_has_type (iter, MSS_NODE_STREAM_QUALITY)) {
       GstMssStreamQuality *quality = gst_mss_stream_quality_new (iter);
       stream->qualities = g_list_prepend (stream->qualities, quality);
@@ -257,17 +276,26 @@ _gst_mss_stream_init (GstMssStream * stream, xmlNodePtr node)
     }
   }
 
-  stream->fragments = g_list_reverse (builder.fragments);
+  if (stream->has_live_fragments) {
+    g_queue_init (&stream->live_fragments);
+    g_queue_push_tail (&stream->live_fragments, builder.fragments->data);
+    stream->current_fragment = g_queue_peek_head_link (&stream->live_fragments);
+  }
+
+  if (builder.fragments) {
+    stream->fragments = g_list_reverse (builder.fragments);
+    stream->current_fragment = stream->fragments;
+  }
 
   /* order them from smaller to bigger based on bitrates */
   stream->qualities =
       g_list_sort (stream->qualities, (GCompareFunc) compare_bitrate);
-
-  stream->current_fragment = stream->fragments;
   stream->current_quality = stream->qualities;
 
   stream->regex_bitrate = g_regex_new ("\\{[Bb]itrate\\}", 0, 0, NULL);
   stream->regex_position = g_regex_new ("\\{start[ _]time\\}", 0, 0, NULL);
+
+  gst_mss_fragment_parser_init (&stream->fragment_parser);
 }
 
 
@@ -313,6 +341,7 @@ gst_mss_manifest_new (GstBuffer * data)
   xmlNodePtr nodeiter;
   gchar *live_str;
   GstMapInfo mapinfo;
+  gchar *look_ahead_fragment_count_str;
 
   if (!gst_buffer_map (data, &mapinfo, GST_MAP_READ)) {
     return NULL;
@@ -330,13 +359,21 @@ gst_mss_manifest_new (GstBuffer * data)
     xmlFree (live_str);
   }
 
+  look_ahead_fragment_count_str =
+      (gchar *) xmlGetProp (root, (xmlChar *) "LookAheadFragmentCount");
+  if (look_ahead_fragment_count_str) {
+    manifest->look_ahead_fragment_count =
+        g_ascii_strtoull (look_ahead_fragment_count_str, NULL, 10);
+    xmlFree (look_ahead_fragment_count_str);
+  }
+
   for (nodeiter = root->children; nodeiter; nodeiter = nodeiter->next) {
     if (nodeiter->type == XML_ELEMENT_NODE
         && (strcmp ((const char *) nodeiter->name, "StreamIndex") == 0)) {
       GstMssStream *stream = g_new0 (GstMssStream, 1);
 
       manifest->streams = g_slist_append (manifest->streams, stream);
-      _gst_mss_stream_init (stream, nodeiter);
+      _gst_mss_stream_init (manifest, stream, nodeiter);
     }
 
     if (nodeiter->type == XML_ELEMENT_NODE
@@ -353,7 +390,12 @@ gst_mss_manifest_new (GstBuffer * data)
 static void
 gst_mss_stream_free (GstMssStream * stream)
 {
-  g_list_free_full (stream->fragments, g_free);
+  if (stream->has_live_fragments) {
+    g_queue_foreach (&stream->live_fragments, (GFunc) g_free, NULL);
+    g_queue_clear (&stream->live_fragments);
+  } else {
+    g_list_free_full (stream->fragments, g_free);
+  }
   g_list_free_full (stream->qualities,
       (GDestroyNotify) gst_mss_stream_quality_free);
   xmlFree (stream->url);
@@ -361,6 +403,7 @@ gst_mss_stream_free (GstMssStream * stream)
   g_regex_unref (stream->regex_position);
   g_regex_unref (stream->regex_bitrate);
   g_free (stream);
+  gst_mss_fragment_parser_clear (&stream->fragment_parser);
 }
 
 void
@@ -979,7 +1022,12 @@ gst_mss_stream_get_fragment_gst_timestamp (GstMssStream * stream)
   g_return_val_if_fail (stream->active, GST_CLOCK_TIME_NONE);
 
   if (!stream->current_fragment) {
-    GList *last = g_list_last (stream->fragments);
+    GList *last;
+
+    if (stream->has_live_fragments)
+      last = g_queue_peek_tail_link (&stream->live_fragments);
+    else
+      last = g_list_last (stream->fragments);
     if (last == NULL)
       return GST_CLOCK_TIME_NONE;
 
@@ -1032,21 +1080,54 @@ GstFlowReturn
 gst_mss_stream_advance_fragment (GstMssStream * stream)
 {
   GstMssStreamFragment *fragment;
+  GstMssStreamFragment *prev_fragment;
+  const gchar *stream_type_name =
+      gst_mss_stream_type_name (gst_mss_stream_get_type (stream));
+
   g_return_val_if_fail (stream->active, GST_FLOW_ERROR);
 
   if (stream->current_fragment == NULL)
     return GST_FLOW_EOS;
 
-  fragment = stream->current_fragment->data;
+  prev_fragment = fragment = stream->current_fragment->data;
   stream->fragment_repetition_index++;
-  if (stream->fragment_repetition_index < fragment->repetitions) {
-    return GST_FLOW_OK;
-  }
+  if (stream->fragment_repetition_index < fragment->repetitions)
+    goto beach;
 
   stream->fragment_repetition_index = 0;
-  stream->current_fragment = g_list_next (stream->current_fragment);
+
+  if (stream->has_live_fragments)
+    stream->current_fragment = g_queue_pop_head_link (&stream->live_fragments);
+  else
+    stream->current_fragment = g_list_next (stream->current_fragment);
+
+  if (stream->current_fragment != NULL) {
+    fragment = stream->current_fragment->data;
+    if (fragment->time <= prev_fragment->time) {
+      while (fragment->time <= prev_fragment->time) {
+        if (stream->has_live_fragments)
+          stream->current_fragment =
+              g_queue_pop_head_link (&stream->live_fragments);
+        else
+          stream->current_fragment = g_list_next (stream->current_fragment);
+        if (stream->current_fragment == NULL)
+          break;
+        fragment = stream->current_fragment->data;
+      }
+    }
+  }
+
+  GST_DEBUG ("Advanced to fragment #%d on %s stream", fragment->number,
+      stream_type_name);
+  if (stream->has_live_fragments)
+    GST_LOG ("%u fragments left in the %s stream queue",
+        g_queue_get_length (&stream->live_fragments), stream_type_name);
   if (stream->current_fragment == NULL)
     return GST_FLOW_EOS;
+
+beach:
+  gst_mss_fragment_parser_clear (&stream->fragment_parser);
+  gst_mss_fragment_parser_init (&stream->fragment_parser);
   return GST_FLOW_OK;
 }
 
@@ -1400,4 +1481,48 @@ const gchar *
 gst_mss_stream_get_lang (GstMssStream * stream)
 {
   return stream->lang;
+}
+
+gboolean
+gst_mss_stream_fragment_parsing_needed (GstMssStream * stream)
+{
+  return stream->fragment_parser.status == GST_MSS_FRAGMENT_HEADER_PARSER_INIT;
+}
+
+void
+gst_mss_stream_fragment_parse (GstMssStream * stream, GstBuffer * buffer)
+{
+  GstMssStreamFragment *current_fragment = NULL;
+  const gchar *stream_type_name =
+      gst_mss_stream_type_name (gst_mss_stream_get_type (stream));
+
+  if (!stream->has_live_fragments)
+    return;
+
+  if (!gst_mss_fragment_parser_add_buffer (&stream->fragment_parser, buffer))
+    return;
+
+  current_fragment = stream->current_fragment->data;
+  current_fragment->time = stream->fragment_parser.tfxd.time;
+  current_fragment->duration = stream->fragment_parser.tfxd.duration;
+
+  for (guint8 index = 0; index < stream->fragment_parser.tfrf.entries_count;
+      index++) {
+    GstMssStreamFragment *last = g_queue_peek_tail (&stream->live_fragments);
+    GstMssStreamFragment *fragment;
+
+    if (last == NULL)
+        break;
+    fragment = g_new (GstMssStreamFragment, 1);
+    fragment->number = last->number + 1;
+    fragment->repetitions = 1;
+    fragment->time = stream->fragment_parser.tfrf.entries[index].time;
+    fragment->duration = stream->fragment_parser.tfrf.entries[index].duration;
+
+    g_queue_push_tail (&stream->live_fragments, fragment);
+    GST_LOG ("Adding fragment number: %u to %s stream, time: %" G_GUINT64_FORMAT
+        ", duration: %" G_GUINT64_FORMAT ", repetitions: %u",
+        fragment->number, stream_type_name,
+        fragment->time, fragment->duration, fragment->repetitions);
+  }
 }
