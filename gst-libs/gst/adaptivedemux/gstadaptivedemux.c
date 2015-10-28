@@ -411,7 +411,7 @@ gst_adaptive_demux_init (GstAdaptiveDemux * demux,
 
   demux->priv = GST_ADAPTIVE_DEMUX_GET_PRIVATE (demux);
   demux->priv->input_adapter = gst_adapter_new ();
-  demux->downloader = gst_uri_downloader_new ();
+  demux->downloader = gst_uri_downloader_new (GST_ELEMENT (demux));
   demux->stream_struct_size = sizeof (GstAdaptiveDemuxStream);
   demux->priv->segment_seqnum = gst_util_seqnum_next ();
   demux->have_group_id = FALSE;
@@ -2318,6 +2318,7 @@ gst_adaptive_demux_stream_update_source (GstAdaptiveDemuxStream * stream,
     GstPadLinkReturn pad_link_ret;
     GObjectClass *gobject_class;
     gchar *internal_name, *bin_name;
+    GstContext *context = NULL;
 
     /* Our src consists of a bin containing uri_handler -> queue2 . The
      * purpose of the queue2 is to allow the uri_handler to download an
@@ -2367,6 +2368,19 @@ gst_adaptive_demux_stream_update_source (GstAdaptiveDemuxStream * stream,
       } else {
         g_object_set (uri_handler, "extra-headers", NULL, NULL);
       }
+    }
+
+    context =
+        gst_element_get_context (GST_ELEMENT_CAST (demux), "http-headers");
+    if (context) {
+      const GstStructure *s = gst_context_get_structure (context);
+      const gchar **cookies = NULL;
+      gst_structure_get (s, "cookies", G_TYPE_STRV, &cookies, NULL);
+      if (cookies) {
+        GST_DEBUG_OBJECT (demux, "Passing cookies through");
+        g_object_set (uri_handler, "cookies", cookies, NULL);
+      }
+      gst_context_unref (context);
     }
 
     /* Source bin creation */
