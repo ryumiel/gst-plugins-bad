@@ -33,6 +33,8 @@ GST_DEBUG_CATEGORY (uridownloader_debug);
 
 struct _GstUriDownloaderPrivate
 {
+  GstElement *parent;
+
   /* Fragments fetcher */
   GstElement *urisrc;
   GstBus *bus;
@@ -148,9 +150,11 @@ gst_uri_downloader_finalize (GObject * object)
 }
 
 GstUriDownloader *
-gst_uri_downloader_new (void)
+gst_uri_downloader_new (GstElement * parent)
 {
-  return g_object_new (GST_TYPE_URI_DOWNLOADER, NULL);
+  GstUriDownloader *downloader = g_object_new (GST_TYPE_URI_DOWNLOADER, NULL);
+  downloader->priv->parent = parent;
+  return downloader;
 }
 
 static gboolean
@@ -353,6 +357,7 @@ gst_uri_downloader_set_uri (GstUriDownloader * downloader, const gchar * uri,
 {
   GstPad *pad;
   GObjectClass *gobject_class;
+  GstContext *context = NULL;
 
   if (!gst_uri_is_valid (uri))
     return FALSE;
@@ -426,6 +431,31 @@ gst_uri_downloader_set_uri (GstUriDownloader * downloader, const gchar * uri,
     } else {
       g_object_set (downloader->priv->urisrc, "extra-headers", NULL, NULL);
     }
+  }
+
+  context = gst_element_get_context (downloader->priv->parent, "http-headers");
+  if (!context) {
+    GstQuery *context_query = gst_query_new_context ("http-headers");
+    GstPad *parent_sink_pad =
+        gst_element_get_static_pad (downloader->priv->parent, "sink");
+    if (gst_pad_peer_query (parent_sink_pad, context_query)) {
+
+      gst_query_parse_context (context_query, &context);
+      gst_element_set_context (downloader->priv->parent, context);
+    }
+    gst_object_unref (parent_sink_pad);
+    gst_query_unref (context_query);
+  }
+
+  if (context) {
+    const GstStructure *s = gst_context_get_structure (context);
+    const gchar **cookies = NULL;
+    gst_structure_get (s, "cookies", G_TYPE_STRV, &cookies, NULL);
+    if (cookies) {
+      GST_DEBUG_OBJECT (downloader, "Passing cookies through");
+      g_object_set (downloader->priv->urisrc, "cookies", cookies, NULL);
+    }
+    gst_context_unref (context);
   }
 
   /* add a sync handler for the bus messages to detect errors in the download */
