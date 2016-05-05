@@ -135,9 +135,16 @@ gst_mss_demux_stream_update_fragment_info (GstAdaptiveDemuxStream * stream);
 static gboolean gst_mss_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek);
 static gint64
 gst_mss_demux_get_manifest_update_interval (GstAdaptiveDemux * demux);
+static gint64
+gst_mss_demux_stream_get_fragment_waiting_time (GstAdaptiveDemuxStream *
+    stream);
 static GstFlowReturn
 gst_mss_demux_update_manifest_data (GstAdaptiveDemux * demux,
     GstBuffer * buffer);
+static GstFlowReturn gst_mss_demux_data_received (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream);
+static gboolean
+gst_mss_demux_requires_periodical_playlist_update (GstAdaptiveDemux * demux);
 
 static void
 gst_mss_demux_class_init (GstMssDemuxClass * klass)
@@ -190,8 +197,13 @@ gst_mss_demux_class_init (GstMssDemuxClass * klass)
       gst_mss_demux_stream_select_bitrate;
   gstadaptivedemux_class->stream_update_fragment_info =
       gst_mss_demux_stream_update_fragment_info;
+  gstadaptivedemux_class->stream_get_fragment_waiting_time =
+      gst_mss_demux_stream_get_fragment_waiting_time;
   gstadaptivedemux_class->update_manifest_data =
       gst_mss_demux_update_manifest_data;
+  gstadaptivedemux_class->data_received = gst_mss_demux_data_received;
+  gstadaptivedemux_class->requires_periodical_playlist_update =
+      gst_mss_demux_requires_periodical_playlist_update;
 
   GST_DEBUG_CATEGORY_INIT (mssdemux_debug, "mssdemux", 0, "mssdemux plugin");
 }
@@ -647,6 +659,17 @@ gst_mss_demux_get_manifest_update_interval (GstAdaptiveDemux * demux)
   return interval;
 }
 
+static gint64
+gst_mss_demux_stream_get_fragment_waiting_time (GstAdaptiveDemuxStream * stream)
+{
+  GstMssDemuxStream *mssstream = (GstMssDemuxStream *) stream;
+  GstMssStreamType streamtype =
+      gst_mss_stream_get_type (mssstream->manifest_stream);
+
+  /* Wait a second for live audio streams so we don't try premature fragments downloading */
+  return streamtype == MSS_STREAM_TYPE_AUDIO ? GST_SECOND : 0;
+}
+
 static GstFlowReturn
 gst_mss_demux_update_manifest_data (GstAdaptiveDemux * demux,
     GstBuffer * buffer)
@@ -657,4 +680,42 @@ gst_mss_demux_update_manifest_data (GstAdaptiveDemux * demux,
 
   gst_mss_manifest_reload_fragments (mssdemux->manifest, buffer);
   return GST_FLOW_OK;
+}
+
+
+static GstFlowReturn
+gst_mss_demux_data_received (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream)
+{
+  GstMssDemux *mssdemux = GST_MSS_DEMUX_CAST (demux);
+  GstMssDemuxStream *mssstream = (GstMssDemuxStream *) stream;
+  gsize available;
+
+  if (!gst_mss_manifest_is_live (mssdemux->manifest)) {
+    return GST_ADAPTIVE_DEMUX_CLASS (parent_class)->data_received (demux,
+        stream);
+  }
+
+  if (gst_mss_stream_fragment_parsing_needed (mssstream->manifest_stream)) {
+    available = gst_adapter_available (stream->adapter);
+    // FIXME: try to reduce this minimal size.
+    if (available < 4096) {
+      return GST_FLOW_OK;
+    } else {
+      GstBuffer *buffer = gst_adapter_get_buffer (stream->adapter, available);
+      GST_LOG_OBJECT (stream->pad, "enough data, parsing fragment.");
+      gst_mss_stream_fragment_parse (mssstream->manifest_stream, buffer);
+      gst_buffer_unref (buffer);
+    }
+  }
+
+  return GST_ADAPTIVE_DEMUX_CLASS (parent_class)->data_received (demux, stream);
+}
+
+static gboolean
+gst_mss_demux_requires_periodical_playlist_update (GstAdaptiveDemux * demux)
+{
+  GstMssDemux *mssdemux = GST_MSS_DEMUX_CAST (demux);
+
+  return (!gst_mss_manifest_is_live (mssdemux->manifest));
 }

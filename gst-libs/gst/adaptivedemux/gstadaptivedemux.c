@@ -271,6 +271,9 @@ gst_adaptive_demux_stream_finish_fragment_default (GstAdaptiveDemux * demux,
 static GstFlowReturn
 gst_adaptive_demux_stream_advance_fragment_unlocked (GstAdaptiveDemux * demux,
     GstAdaptiveDemuxStream * stream, GstClockTime duration);
+static gboolean
+gst_adaptive_demux_requires_periodical_playlist_update_default (GstAdaptiveDemux
+    * demux);
 
 
 /* we can't use G_DEFINE_ABSTRACT_TYPE because we need the klass in the _init
@@ -393,6 +396,9 @@ gst_adaptive_demux_class_init (GstAdaptiveDemuxClass * klass)
   klass->data_received = gst_adaptive_demux_stream_data_received_default;
   klass->finish_fragment = gst_adaptive_demux_stream_finish_fragment_default;
   klass->update_manifest = gst_adaptive_demux_update_manifest_default;
+  klass->requires_periodical_playlist_update =
+      gst_adaptive_demux_requires_periodical_playlist_update_default;
+
 }
 
 static void
@@ -624,7 +630,9 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
           gst_adaptive_demux_start_tasks (demux);
           if (gst_adaptive_demux_is_live (demux)) {
             /* Task to periodically update the manifest */
-            gst_task_start (demux->priv->updates_task);
+            if (demux_class->requires_periodical_playlist_update (demux)) {
+              gst_task_start (demux->priv->updates_task);
+            }
           }
         } else {
           /* no streams */
@@ -1978,6 +1986,13 @@ gst_adaptive_demux_stream_data_received_default (GstAdaptiveDemux * demux,
   return gst_adaptive_demux_stream_push_buffer (stream, buffer);
 }
 
+static gboolean
+gst_adaptive_demux_requires_periodical_playlist_update_default (GstAdaptiveDemux
+    * demux)
+{
+  return TRUE;
+}
+
 static GstFlowReturn
 _src_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 {
@@ -2074,7 +2089,7 @@ _src_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   stream->download_total_bytes += gst_buffer_get_size (buffer);
 
   gst_adapter_push (stream->adapter, buffer);
-  GST_DEBUG_OBJECT (stream->pad, "Received buffer of size %" G_GSIZE_FORMAT
+  GST_LOG_OBJECT (stream->pad, "Received buffer of size %" G_GSIZE_FORMAT
       ". Now %" G_GSIZE_FORMAT " on adapter", gst_buffer_get_size (buffer),
       gst_adapter_available (stream->adapter));
 
